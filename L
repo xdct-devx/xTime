@@ -1,0 +1,6 @@
+```loadstring(game:HttpGet("https://raw.githubusercontent.com/Bodzio21/Magnesium/refs/heads/main/Loader"))()```
+
+
+
+
+## Key: ```nissan234```
