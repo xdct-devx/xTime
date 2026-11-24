@@ -1,0 +1,2358 @@
+--[[
+    xTime sdbf  |  Wind-UI <3
+    afafaf you a femboy :3
+    aawgawgaegkeah open source >;/
+]]
+
+----------------------------------------------------------------------
+-- Services
+----------------------------------------------------------------------
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui          = game:GetService("CoreGui")
+local Workspace        = game:GetService("Workspace")
+local StatsService     = game:GetService("Stats")
+
+local lp = Players.LocalPlayer
+local playerGui = lp:WaitForChild("PlayerGui")
+
+local LOGO = "rbxassetid://117164894132845"
+local APP_NAME = "xTime sdbf"
+
+----------------------------------------------------------------------
+-- Clean up previous runs (including the older "SBDF Hub" build)
+----------------------------------------------------------------------
+if _G.XTIME_CLEANUP then pcall(_G.XTIME_CLEANUP) end
+if _G.SBDF_HUB_CLEANUP then pcall(_G.SBDF_HUB_CLEANUP) end
+
+----------------------------------------------------------------------
+-- Config
+----------------------------------------------------------------------
+local DEFAULTS = {
+    -- Auto Parry
+    AutoParry = false,
+    ParryMode = "Ivory > Azure", -- "Ivory > Azure" | "Azure only"
+    Delay = 0,
+    Humanize = false,
+    HumanizeMin = 90,
+    HumanizeMax = 180,
+    PingComp = true,
+    Cooldown = 250,
+    Settle = 25,
+    AzureAutoE = true,
+
+    -- NPC Reach
+    ReachEnabled = false,
+    ReachDistance = 15,
+    ReachProfile = "Standard", -- Legit | Standard | Extreme | Deadly
+    ReachShape = "Sphere",     -- Sphere | Square | Line | Sector
+    ReachAlwaysActive = false,
+    ReachHitDelay = 0.08,
+    ReachExpandWeapon = false,
+    ReachAggressive = false,
+    ReachPredictive = true,
+    ReachBacktrack = false,
+    ReachBacktrackWindow = 0.5,
+    ReachWallCheck = false,
+    ReachRandom = false,
+    ReachRandomStrength = 2,
+    ReachInstaKill = false,
+    ReachInstaKillParts = 12,
+    ReachInstaKillRate = 0.05,
+    ReachTouchKill = false,
+    ReachTouchRange = 8,
+    ReachShowVisualizer = true,
+    ReachVisualizerTransparency = 0.85,
+
+    -- Performance
+    PerfMode = "Balanced",
+    PerfMaxTargets = 6,
+    PerfKillThrottle = 0.15,
+    PerfRemoteCooldown = 0.5,
+
+    -- Auto Clicker
+    AutoClick = false,
+    ClickCPS = 10,
+    ClickNearOnly = false,
+
+    -- Boss
+    BossLock = false,
+    BossOrbit = false,
+    OrbitSpeed = 10,
+    OrbitDistance = 8,
+
+    -- Movement
+    TPWalk = false,
+    TPWalkSpeed = 30,
+    FloatEnabled = false,
+    FloatHeight = 15,
+
+    -- ESP
+    ESPEnabled = false,
+    ESPHighlight = true,
+    ESPNames = true,
+    ESPHealth = true,
+    ESPDistance = true,
+    ESPMaxDistance = 500,
+    ESPColor = Color3.fromRGB(248, 113, 113),
+
+    -- Misc
+    Identity = "xTime",
+    IdentityApplied = false,
+}
+
+local Config = _G.XTIME_CONFIG or {}
+_G.XTIME_CONFIG = Config
+for key, value in pairs(DEFAULTS) do
+    if Config[key] == nil then
+        Config[key] = value
+    end
+end
+if Config.ShowButtons == nil then
+    Config.ShowButtons = UserInputService.TouchEnabled -- on by default for phones/tablets
+end
+
+-- Never start with these switched on
+for _, key in ipairs({ "AutoParry", "ReachEnabled", "AutoClick", "TPWalk", "FloatEnabled",
+    "ESPEnabled", "ReachInstaKill", "ReachTouchKill", "BossLock", "BossOrbit" }) do
+    Config[key] = false
+end
+
+----------------------------------------------------------------------
+-- Lifetime
+----------------------------------------------------------------------
+local running = true
+local connections = {}
+local cleanupTasks = {}
+local Window
+
+local function bind(signal, callback)
+    local connection = signal:Connect(callback)
+    connections[#connections + 1] = connection
+    return connection
+end
+
+local function onCleanup(fn)
+    cleanupTasks[#cleanupTasks + 1] = fn
+end
+
+local function cleanup()
+    if not running then return end
+    running = false
+
+    for _, connection in ipairs(connections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(connections)
+
+    for _, fn in ipairs(cleanupTasks) do
+        pcall(fn)
+    end
+    table.clear(cleanupTasks)
+
+    if Window then
+        local w = Window
+        Window = nil
+        pcall(function() w:Destroy() end)
+    end
+
+    _G.XTIME_CLEANUP = nil
+end
+
+_G.XTIME_CLEANUP = cleanup
+
+----------------------------------------------------------------------
+-- Shared state / helpers
+----------------------------------------------------------------------
+local Shared = {
+    parryBusy = false,       -- Reach + Auto Clicker pause while Parry swaps tools
+    platformY = nil,         -- Floating Ground height (Boss Orbit respects it)
+    platformLocked = false,
+    lastActivated = 0,       -- last time a tool was activated (manual or auto)
+}
+
+local function getRoot(model)
+    return model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChild("Torso")
+        or model:FindFirstChild("UpperTorso")
+        or model.PrimaryPart
+end
+
+local function getHumanoid(model)
+    return model and model:FindFirstChildOfClass("Humanoid")
+end
+
+local function getPing()
+    local ok, value = pcall(function()
+        return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    return (ok and type(value) == "number") and value or 0
+end
+
+local function guiParent()
+    local ok, parent = pcall(function()
+        return (typeof(gethui) == "function" and gethui()) or CoreGui
+    end)
+    return (ok and parent) or playerGui
+end
+
+local function mountGui(gui)
+    local ok = pcall(function() gui.Parent = guiParent() end)
+    if not ok or not gui.Parent then
+        gui.Parent = playerGui
+    end
+end
+
+----------------------------------------------------------------------
+-- Load Wind-UI
+----------------------------------------------------------------------
+local WindUI
+for _, url in ipairs({
+    "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua",
+    "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua",
+}) do
+    local ok, result = pcall(function()
+        return loadstring(game:HttpGet(url))()
+    end)
+    if ok and result then
+        WindUI = result
+        break
+    end
+end
+
+if not WindUI then
+    error("[xTime] Could not load Wind-UI. Check your internet and that your executor supports HttpGet.")
+end
+
+local function notify(title, content, duration, icon)
+    pcall(function()
+        WindUI:Notify({
+            Title = title,
+            Content = content or "",
+            Duration = duration or 3,
+            Icon = icon,
+        })
+    end)
+end
+
+pcall(function()
+    WindUI:AddTheme({
+        Name = "xTime Midnight",
+        Accent = Color3.fromHex("#0f172a"),
+        Dialog = Color3.fromHex("#0b1220"),
+        Outline = Color3.fromHex("#38bdf8"),
+        Text = Color3.fromHex("#e2e8f0"),
+        Placeholder = Color3.fromHex("#64748b"),
+        Background = Color3.fromHex("#070b14"),
+        Button = Color3.fromHex("#1e293b"),
+        Icon = Color3.fromHex("#38bdf8"),
+        Toggle = Color3.fromHex("#38bdf8"),
+        Slider = Color3.fromHex("#38bdf8"),
+        Checkbox = Color3.fromHex("#38bdf8"),
+    })
+end)
+
+----------------------------------------------------------------------
+-- ===================== AUTO PARRY ==================================
+----------------------------------------------------------------------
+local TRIGGER_ID = "214269134"
+local TOOL_IVORY = "Ivory Periastron"
+local TOOL_AZURE = "Azure Periastron"
+local TORSO_NAMES = { Torso = true, UpperTorso = true }
+
+local telemetry = { parries = 0, latency = nil, ping = 0 }
+local refreshStatus
+
+local function findTool(name)
+    local character = lp.Character
+    local backpack = lp:FindFirstChildOfClass("Backpack")
+    return (character and character:FindFirstChild(name)) or (backpack and backpack:FindFirstChild(name))
+end
+
+local function equip(name)
+    local humanoid = getHumanoid(lp.Character)
+    local tool = findTool(name)
+    if humanoid and tool and tool.Parent ~= lp.Character then
+        humanoid:EquipTool(tool)
+    end
+    return tool
+end
+
+local function waitEquipped(tool, timeout)
+    local character = lp.Character
+    local startedAt = os.clock()
+    while running and tool.Parent ~= character and os.clock() - startedAt < (timeout or 0.3) do
+        RunService.Heartbeat:Wait()
+    end
+    return tool.Parent == character
+end
+
+local function fireE(tool)
+    local remote = tool and tool:FindFirstChild("Remote")
+    if remote then
+        remote:FireServer(Enum.KeyCode.E)
+        return true
+    end
+    return false
+end
+
+local function settle()
+    if Config.Settle > 0 then
+        task.wait(Config.Settle / 1000)
+    end
+end
+
+local parryBusy = false
+local lastTrigger = 0
+
+local function computeDelay()
+    local ms
+    if Config.Humanize then
+        local low = math.min(Config.HumanizeMin, Config.HumanizeMax)
+        local high = math.max(Config.HumanizeMin, Config.HumanizeMax)
+        ms = math.random(low, high)
+    else
+        ms = Config.Delay
+    end
+    if Config.PingComp then
+        ms = ms - telemetry.ping
+    end
+    return math.max(ms, 0) / 1000
+end
+
+local function runParry(detectedAt)
+    local humanoid = getHumanoid(lp.Character)
+    if not humanoid or humanoid.Health <= 0 then return end
+
+    local firedAt
+
+    if Config.ParryMode == "Ivory > Azure" then
+        local ivory = equip(TOOL_IVORY)
+        if ivory and waitEquipped(ivory) then
+            settle()
+            fireE(ivory)
+            firedAt = firedAt or os.clock()
+            task.wait(0.01)
+            fireE(ivory)
+        end
+    else
+        humanoid:UnequipTools()
+        RunService.Heartbeat:Wait()
+    end
+
+    local azure = equip(TOOL_AZURE)
+    if azure and waitEquipped(azure) then
+        settle()
+        fireE(azure)
+        firedAt = firedAt or os.clock()
+    end
+
+    if firedAt then
+        telemetry.parries = telemetry.parries + 1
+        telemetry.latency = (firedAt - detectedAt) * 1000
+        if refreshStatus then refreshStatus() end
+    end
+end
+
+local function triggerParry()
+    local now = os.clock()
+    if parryBusy or now - lastTrigger < Config.Cooldown / 1000 then return end
+
+    parryBusy = true
+    Shared.parryBusy = true
+    lastTrigger = now
+    telemetry.ping = getPing()
+
+    task.spawn(function()
+        local delay = computeDelay()
+        if delay > 0 then task.wait(delay) end
+
+        local ok, err = pcall(runParry, now)
+        if not ok then
+            warn("[xTime] parry error: " .. tostring(err))
+        end
+
+        parryBusy = false
+        Shared.parryBusy = false
+    end)
+end
+
+local function matchesTrigger(instance)
+    local id
+    if instance:IsA("ParticleEmitter") then
+        id = instance.Texture
+    elseif instance:IsA("MeshPart") or instance:IsA("SpecialMesh") then
+        id = instance.MeshId
+    end
+    return id ~= nil and string.match(id, "%d+") == TRIGGER_ID
+end
+
+local function onDescendantAdded(instance)
+    if not Config.AutoParry then return end
+
+    local character = lp.Character
+    local parent = instance.Parent
+    if not character or not parent or parent.Name ~= "IFrame" then return end
+
+    local torso = parent.Parent
+    if not (torso and TORSO_NAMES[torso.Name] and torso.Parent == character) then return end
+
+    if not (instance:IsA("ParticleEmitter") or instance:IsA("MeshPart") or instance:IsA("SpecialMesh")) then
+        return
+    end
+
+    if matchesTrigger(instance) then
+        triggerParry()
+    else
+        task.defer(function()
+            if running and instance.Parent and matchesTrigger(instance) then
+                triggerParry()
+            end
+        end)
+    end
+end
+
+local characterConnections = {}
+
+local function hookParryCharacter(character)
+    for _, connection in ipairs(characterConnections) do
+        connection:Disconnect()
+    end
+    table.clear(characterConnections)
+
+    characterConnections[1] = character.DescendantAdded:Connect(onDescendantAdded)
+    characterConnections[2] = character.ChildAdded:Connect(function(child)
+        if Config.AutoParry and Config.AzureAutoE and not parryBusy
+            and child:IsA("Tool") and child.Name == TOOL_AZURE then
+            task.delay(Config.Settle / 1000, fireE, child)
+        end
+    end)
+end
+
+onCleanup(function()
+    for _, connection in ipairs(characterConnections) do
+        connection:Disconnect()
+    end
+end)
+
+bind(lp.CharacterAdded, hookParryCharacter)
+if lp.Character then hookParryCharacter(lp.Character) end
+
+----------------------------------------------------------------------
+-- ===================== NPC CACHE (shared) ==========================
+----------------------------------------------------------------------
+local npcSet = setmetatable({}, { __mode = "k" })
+local npcList = {}
+local npcListDirty = true
+local npcListBuiltAt = 0
+
+local function isPlayerCharacter(model)
+    return model == lp.Character or Players:GetPlayerFromCharacter(model) ~= nil
+end
+
+local function registerHumanoid(humanoid)
+    local model = humanoid.Parent
+    if model and model:IsA("Model") then
+        npcSet[model] = true
+        npcListDirty = true
+    end
+end
+
+local function scanNPCs()
+    local counter = 0
+    for _, descendant in ipairs(Workspace:GetDescendants()) do
+        if descendant:IsA("Humanoid") then
+            registerHumanoid(descendant)
+        end
+        counter = counter + 1
+        if counter % 400 == 0 then
+            task.wait()
+            if not running then return end
+        end
+    end
+end
+
+bind(Workspace.DescendantAdded, function(descendant)
+    if descendant:IsA("Humanoid") then
+        registerHumanoid(descendant)
+    end
+end)
+
+bind(Workspace.DescendantRemoving, function(descendant)
+    if descendant:IsA("Humanoid") then
+        local model = descendant.Parent
+        if model and npcSet[model] then
+            npcSet[model] = nil
+            npcListDirty = true
+        end
+    end
+end)
+
+task.spawn(scanNPCs)
+
+-- NPC models only (players are always excluded). Rebuilt at most once per second.
+local function getNPCs()
+    local now = os.clock()
+    if npcListDirty and now - npcListBuiltAt > 1 then
+        npcListBuiltAt = now
+        npcListDirty = false
+        npcList = {}
+        for model in pairs(npcSet) do
+            if model.Parent and not isPlayerCharacter(model) then
+                npcList[#npcList + 1] = model
+            end
+        end
+    end
+    return npcList
+end
+
+----------------------------------------------------------------------
+-- ===================== BOSS LOCK / ORBIT ===========================
+----------------------------------------------------------------------
+local bossTarget
+local orbitAngle = 0
+local setTargetLabel
+
+local function scanForBoss(container, origin, best, bestDistance, depth)
+    for _, object in ipairs(container:GetChildren()) do
+        if object:IsA("Model") then
+            local humanoid = object:FindFirstChildOfClass("Humanoid")
+            if humanoid then
+                if object ~= lp.Character and humanoid.Health > 0
+                    and not Players:GetPlayerFromCharacter(object) then
+                    local root = getRoot(object)
+                    if root then
+                        local distance = (root.Position - origin).Magnitude
+                        if distance < bestDistance then
+                            best, bestDistance = object, distance
+                        end
+                    end
+                end
+            elseif depth < 4 then
+                best, bestDistance = scanForBoss(object, origin, best, bestDistance, depth + 1)
+            end
+        elseif object:IsA("Folder") and depth < 4 then
+            best, bestDistance = scanForBoss(object, origin, best, bestDistance, depth + 1)
+        end
+    end
+    return best, bestDistance
+end
+
+task.spawn(function()
+    while running do
+        task.wait(0.3)
+
+        if Config.BossLock or Config.BossOrbit then
+            local character = lp.Character
+            local root = character and getRoot(character)
+            if root then
+                bossTarget = scanForBoss(Workspace, root.Position, nil, 500, 0)
+            end
+            if setTargetLabel then
+                setTargetLabel(bossTarget and ("Target: " .. bossTarget.Name) or "Target: none within 500 studs")
+            end
+        else
+            bossTarget = nil
+            if setTargetLabel then
+                setTargetLabel("Target: idle (Boss Lock and Orbit are off)")
+            end
+        end
+    end
+end)
+
+bind(RunService.RenderStepped, function(delta)
+    if not (Config.BossLock or Config.BossOrbit) or not bossTarget then return end
+
+    local character = lp.Character
+    local root = character and getRoot(character)
+    local targetRoot = getRoot(bossTarget)
+    if not (root and targetRoot) then return end
+
+    local targetPosition = targetRoot.Position
+
+    if Config.BossOrbit then
+        orbitAngle = (orbitAngle + Config.OrbitSpeed * 0.2 * delta * 30) % (math.pi * 2)
+
+        -- With Floating Ground on, keep our current height so we stay on the platform
+        local y = (Config.FloatEnabled and Shared.platformLocked) and root.Position.Y or targetPosition.Y
+
+        local position = Vector3.new(
+            targetPosition.X + math.cos(orbitAngle) * Config.OrbitDistance,
+            y,
+            targetPosition.Z + math.sin(orbitAngle) * Config.OrbitDistance
+        )
+        local goal = CFrame.new(position, Vector3.new(targetPosition.X, position.Y, targetPosition.Z))
+        local alpha = math.clamp(Config.OrbitSpeed / 200 * 1.5, 0.2, 1)
+        root.CFrame = root.CFrame:Lerp(goal, alpha)
+    elseif Config.BossLock then
+        local goal = CFrame.new(root.Position, Vector3.new(targetPosition.X, root.Position.Y, targetPosition.Z))
+        root.CFrame = root.CFrame:Lerp(goal, 0.4)
+    end
+end)
+
+----------------------------------------------------------------------
+-- ===================== TP WALK =====================================
+----------------------------------------------------------------------
+bind(RunService.Heartbeat, function(dt)
+    if not Config.TPWalk then return end
+
+    local character = lp.Character
+    local humanoid = getHumanoid(character)
+    if humanoid and humanoid.Health > 0 and humanoid.MoveDirection.Magnitude > 0 then
+        character:TranslateBy(humanoid.MoveDirection * Config.TPWalkSpeed * dt)
+    end
+end)
+
+----------------------------------------------------------------------
+-- ===================== FLOATING GROUND =============================
+----------------------------------------------------------------------
+local CAP_SIZE = 6
+local CAP_THICKNESS = 1
+local POLE_SIZE = 2
+local FALL_PROTECTION = 8
+
+local floatCharacter, floatHumanoid, floatHrp
+local capPart, polePart
+local floatBaseY = 0
+local floatGroundY = 0
+local floatDiedConn
+local floatHeartbeat
+
+local function destroyFloatParts()
+    if capPart then capPart:Destroy() capPart = nil end
+    if polePart then polePart:Destroy() polePart = nil end
+end
+
+local function createFloatParts()
+    destroyFloatParts()
+
+    local cap = Instance.new("Part")
+    cap.Name = "xTimeFloatCap_" .. lp.Name
+    cap.Size = Vector3.new(CAP_SIZE, CAP_THICKNESS, CAP_SIZE)
+    cap.Anchored = true
+    cap.CanCollide = true
+    cap.CanTouch = false
+    cap.CanQuery = false
+    cap.Material = Enum.Material.ForceField
+    cap.Color = Color3.fromRGB(56, 189, 248)
+    cap.Transparency = 0.25
+    cap.TopSurface = Enum.SurfaceType.Smooth
+    cap.BottomSurface = Enum.SurfaceType.Smooth
+    cap.Parent = Workspace
+    capPart = cap
+
+    local pole = Instance.new("Part")
+    pole.Name = "xTimeFloatPole_" .. lp.Name
+    pole.Size = Vector3.new(POLE_SIZE, 1, POLE_SIZE)
+    pole.Anchored = true
+    pole.CanCollide = false
+    pole.CanTouch = false
+    pole.CanQuery = false
+    pole.Material = Enum.Material.ForceField
+    pole.Color = Color3.fromRGB(56, 189, 248)
+    pole.Transparency = 0.6
+    pole.Parent = Workspace
+    polePart = pole
+end
+
+local function getGroundY()
+    if not floatHrp or not floatHrp.Parent then return nil end
+
+    local filter = {}
+    if capPart then filter[#filter + 1] = capPart end
+    if polePart then filter[#filter + 1] = polePart end
+    if floatCharacter then filter[#filter + 1] = floatCharacter end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = filter
+    params.IgnoreWater = true
+
+    local result = Workspace:Raycast(floatHrp.Position, Vector3.new(0, -1000, 0), params)
+    return result and result.Position.Y or nil
+end
+
+local function placeOnPlatform(force)
+    if not Config.FloatEnabled or not Shared.platformLocked or not Shared.platformY then return end
+    if not floatHrp or not floatHrp.Parent or not floatHumanoid or floatHumanoid.Health <= 0 or not capPart then
+        return
+    end
+
+    local safeY = Shared.platformY + CAP_THICKNESS / 2 + 2.5
+    if force or floatHrp.Position.Y < safeY - FALL_PROTECTION then
+        floatHrp.CFrame = CFrame.new(floatHrp.Position.X, safeY, floatHrp.Position.Z)
+        floatHrp.AssemblyLinearVelocity = Vector3.zero
+        floatHrp.AssemblyAngularVelocity = Vector3.zero
+    end
+end
+
+local function lockPlatformFromCurrent()
+    if not floatHrp or not floatHrp.Parent then return end
+
+    local ground = getGroundY() or (floatHrp.Position.Y - 3)
+    floatGroundY = ground
+    floatBaseY = ground
+    Shared.platformY = floatBaseY + Config.FloatHeight
+    Shared.platformLocked = true
+end
+
+local function updatePlatform()
+    if not capPart or not polePart then return end
+
+    if not Config.FloatEnabled or not Shared.platformLocked or not Shared.platformY then
+        capPart.CanCollide = false
+        capPart.Transparency = 1
+        polePart.Transparency = 1
+        return
+    end
+
+    if not floatCharacter or not floatCharacter.Parent or not floatHumanoid
+        or floatHumanoid.Health <= 0 or not floatHrp or not floatHrp.Parent then
+        return
+    end
+
+    capPart.CanCollide = true
+    capPart.Transparency = 0.25
+    polePart.Transparency = 0.6
+
+    local x, z = floatHrp.Position.X, floatHrp.Position.Z
+    capPart.CFrame = CFrame.new(x, Shared.platformY - CAP_THICKNESS / 2, z)
+
+    local poleHeight = math.max(Shared.platformY - floatGroundY, 0.1)
+    polePart.Size = Vector3.new(POLE_SIZE, poleHeight, POLE_SIZE)
+    polePart.CFrame = CFrame.new(x, floatGroundY + poleHeight / 2, z)
+
+    placeOnPlatform(false)
+end
+
+local function onFloatCharacter(char)
+    if floatHeartbeat then floatHeartbeat:Disconnect() floatHeartbeat = nil end
+    if floatDiedConn then floatDiedConn:Disconnect() floatDiedConn = nil end
+
+    floatCharacter = char
+    floatHumanoid = char:WaitForChild("Humanoid", 10)
+    floatHrp = char:WaitForChild("HumanoidRootPart", 10)
+    if not (floatHumanoid and floatHrp) or not running then return end
+
+    createFloatParts()
+    task.wait(0.15)
+
+    if Config.FloatEnabled then
+        lockPlatformFromCurrent()
+        placeOnPlatform(true)
+    else
+        Shared.platformLocked = false
+    end
+
+    floatDiedConn = floatHumanoid.Died:Connect(function()
+        Shared.platformLocked = false
+        if floatHeartbeat then floatHeartbeat:Disconnect() floatHeartbeat = nil end
+        task.delay(0.5, destroyFloatParts)
+    end)
+
+    floatHeartbeat = RunService.Heartbeat:Connect(updatePlatform)
+end
+
+bind(lp.CharacterAdded, onFloatCharacter)
+bind(lp.CharacterRemoving, function()
+    if floatHeartbeat then floatHeartbeat:Disconnect() floatHeartbeat = nil end
+    if floatDiedConn then floatDiedConn:Disconnect() floatDiedConn = nil end
+    destroyFloatParts()
+    Shared.platformLocked = false
+    Shared.platformY = nil
+    floatCharacter, floatHumanoid, floatHrp = nil, nil, nil
+end)
+
+onCleanup(function()
+    if floatHeartbeat then floatHeartbeat:Disconnect() end
+    if floatDiedConn then floatDiedConn:Disconnect() end
+    destroyFloatParts()
+    Shared.platformLocked = false
+end)
+
+if lp.Character then task.spawn(onFloatCharacter, lp.Character) end
+
+local function setFloatEnabled(on)
+    Config.FloatEnabled = on
+    if on then
+        lockPlatformFromCurrent()
+        task.defer(placeOnPlatform, true)
+    else
+        Shared.platformLocked = false
+    end
+end
+
+local function setFloatHeight(value)
+    Config.FloatHeight = value
+    if Config.FloatEnabled and Shared.platformLocked then
+        Shared.platformY = floatBaseY + value
+        placeOnPlatform(true)
+    end
+end
+
+----------------------------------------------------------------------
+-- ===================== NPC REACH ===================================
+----------------------------------------------------------------------
+local fireTouch = firetouchinterest
+
+-- Visualizer
+local visualizerPart
+local sectorParts = {}
+
+local function destroyVisualizer()
+    if visualizerPart then
+        visualizerPart:Destroy()
+        visualizerPart = nil
+    end
+    for _, part in ipairs(sectorParts) do part:Destroy() end
+    table.clear(sectorParts)
+end
+
+onCleanup(destroyVisualizer)
+
+local function newVisualPart()
+    local part = Instance.new("Part")
+    part.Material = Enum.Material.ForceField
+    part.CanCollide = false
+    part.CanQuery = false
+    part.CanTouch = false
+    part.CastShadow = false
+    part.Anchored = true
+    part.Archivable = false
+    return part
+end
+
+local SECTOR_SPOKES, SECTOR_ARC = 24, 14
+local SECTOR_HALF_ANGLE = math.rad(50)
+
+local function updateVisualizer()
+    if not (Config.ReachEnabled and Config.ReachShowVisualizer) then
+        if visualizerPart or #sectorParts > 0 then destroyVisualizer() end
+        return
+    end
+
+    local character = lp.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local parent = Workspace.CurrentCamera or Workspace
+    local reach = Config.ReachDistance
+    local drawReach = math.min(reach, 1000) -- Roblox parts are limited to 2048 studs per side
+    local transparency = Config.ReachVisualizerTransparency
+    local danger = Config.ReachAggressive or Config.ReachInstaKill or Config.ReachTouchKill
+    local color = danger and Color3.fromRGB(248, 113, 113) or Color3.fromRGB(56, 189, 248)
+
+    if Config.ReachShape == "Sector" and not Config.ReachAggressive then
+        if visualizerPart then
+            visualizerPart:Destroy()
+            visualizerPart = nil
+        end
+
+        local total = SECTOR_SPOKES + SECTOR_ARC
+        while #sectorParts < total do
+            sectorParts[#sectorParts + 1] = newVisualPart()
+        end
+
+        local step = (2 * SECTOR_HALF_ANGLE) / math.max(SECTOR_SPOKES - 1, 1)
+        local width = math.max(1, drawReach * step * 1.25)
+
+        for i = 1, SECTOR_SPOKES do
+            local part = sectorParts[i]
+            local angle = -SECTOR_HALF_ANGLE + (i - 1) / (SECTOR_SPOKES - 1) * (2 * SECTOR_HALF_ANGLE)
+            part.Color = color
+            part.Transparency = transparency
+            part.Size = Vector3.new(width, 3.5, drawReach)
+            part.CFrame = (root.CFrame * CFrame.Angles(0, angle, 0)) * CFrame.new(0, 0, -drawReach / 2)
+            part.Parent = parent
+        end
+
+        for j = 1, SECTOR_ARC do
+            local part = sectorParts[SECTOR_SPOKES + j]
+            local angle = -SECTOR_HALF_ANGLE + (j - 1) / (SECTOR_ARC - 1) * (2 * SECTOR_HALF_ANGLE)
+            part.Color = color
+            part.Transparency = transparency
+            part.Size = Vector3.new(width, 3.5, width)
+            part.CFrame = root.CFrame * CFrame.new(math.sin(angle) * drawReach, 0, -math.cos(angle) * drawReach)
+            part.Parent = parent
+        end
+        return
+    end
+
+    if #sectorParts > 0 then
+        for _, part in ipairs(sectorParts) do part:Destroy() end
+        table.clear(sectorParts)
+    end
+
+    if not visualizerPart or not visualizerPart.Parent then
+        if visualizerPart then visualizerPart:Destroy() end
+        visualizerPart = newVisualPart()
+        visualizerPart.Name = "xTimeReachVisualizer"
+    end
+
+    visualizerPart.Parent = parent
+    visualizerPart.Color = color
+    visualizerPart.Transparency = transparency
+
+    local shape = Config.ReachAggressive and "Sphere" or Config.ReachShape
+    if shape == "Sphere" then
+        visualizerPart.Shape = Enum.PartType.Ball
+        visualizerPart.Size = Vector3.new(drawReach * 2, drawReach * 2, drawReach * 2)
+        visualizerPart.CFrame = root.CFrame
+    elseif shape == "Square" then
+        visualizerPart.Shape = Enum.PartType.Block
+        visualizerPart.Size = Vector3.new(drawReach * 2, drawReach * 2, drawReach * 2)
+        visualizerPart.CFrame = root.CFrame
+    else -- Line
+        visualizerPart.Shape = Enum.PartType.Block
+        visualizerPart.Size = Vector3.new(4, 7, drawReach)
+        visualizerPart.CFrame = root.CFrame * CFrame.new(0, 0, -drawReach / 2)
+    end
+end
+
+bind(RunService.RenderStepped, updateVisualizer)
+
+-- Hitbox math
+local function isWallBetween(from, to, ignoreModel)
+    local filter = {}
+    if lp.Character then filter[#filter + 1] = lp.Character end
+    if ignoreModel then filter[#filter + 1] = ignoreModel end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = filter
+
+    local result = Workspace:Raycast(from, to - from, params)
+    if result then
+        local hit = result.Instance
+        return hit.CanCollide and hit.Anchored
+    end
+    return false
+end
+
+local function inReachHitbox(origin, targetPos, rootCF)
+    local reach = Config.ReachDistance
+    if Config.ReachRandom then
+        reach = reach + (math.random(-100, 100) / 100) * Config.ReachRandomStrength
+    end
+
+    local toTarget = targetPos - origin
+    local dist = toTarget.Magnitude
+
+    if Config.ReachAggressive then
+        return dist <= reach
+    end
+
+    local relPos = rootCF:PointToObjectSpace(targetPos)
+    local flatFwd = Vector3.new(rootCF.LookVector.X, 0, rootCF.LookVector.Z)
+    local flatDir = Vector3.new(toTarget.X, 0, toTarget.Z)
+    local dot = 1
+    if flatFwd.Magnitude > 0.001 and flatDir.Magnitude > 0.001 then
+        dot = flatFwd.Unit:Dot(flatDir.Unit)
+    end
+
+    local legit = Config.ReachProfile == "Legit"
+    if legit and dot < 0.707 then return false end
+
+    local shape = Config.ReachShape
+    if shape == "Sphere" then
+        return dist <= reach
+    elseif shape == "Square" then
+        return math.abs(relPos.X) <= reach and math.abs(relPos.Y) <= reach and math.abs(relPos.Z) <= reach
+    elseif shape == "Line" then
+        local inLane = math.abs(relPos.X) <= 2 and math.abs(relPos.Y) <= 3.5
+        if legit then
+            return inLane and relPos.Z <= 0 and relPos.Z >= -reach
+        end
+        return inLane and math.abs(relPos.Z) <= reach
+    elseif shape == "Sector" then
+        return dist <= reach and math.abs(relPos.Y) <= 3.5 and dot >= 0.6428
+    end
+    return false
+end
+
+-- Backtrack (newest entry last)
+local backtrackBuffers = setmetatable({}, { __mode = "k" })
+
+local function recordBacktrack(model, rootPart, now)
+    local buffer = backtrackBuffers[model]
+    if not buffer then
+        buffer = {}
+        backtrackBuffers[model] = buffer
+    end
+
+    buffer[#buffer + 1] = { pos = rootPart.Position, t = now }
+
+    local window = Config.ReachBacktrackWindow
+    while buffer[1] and now - buffer[1].t > window do
+        table.remove(buffer, 1)
+    end
+end
+
+bind(RunService.Heartbeat, function()
+    if not (Config.ReachEnabled and Config.ReachBacktrack) then return end
+
+    local character = lp.Character
+    local myRoot = character and character:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return end
+
+    local now = os.clock()
+    local maxRange = Config.ReachDistance * 2 + 20
+
+    for _, model in ipairs(getNPCs()) do
+        local rootPart = model:FindFirstChild("HumanoidRootPart")
+        if rootPart and (rootPart.Position - myRoot.Position).Magnitude <= maxRange then
+            recordBacktrack(model, rootPart, now)
+        end
+    end
+end)
+
+-- Touch kill
+local killCooldowns = setmetatable({}, { __mode = "k" })
+local remoteCooldowns = setmetatable({}, { __mode = "k" })
+
+local function killNPCTouch(model, part)
+    if not model or not model.Parent then return end
+
+    local now = os.clock()
+    if now - (killCooldowns[model] or 0) < Config.PerfKillThrottle then return end
+    killCooldowns[model] = now
+
+    local humanoid = getHumanoid(model)
+
+    if humanoid and humanoid.Health > 0 then
+        pcall(function()
+            humanoid.Health = 0
+            humanoid:TakeDamage(999999999)
+        end)
+        if humanoid.Health <= 0 then return end
+    end
+
+    if now - (remoteCooldowns[model] or 0) >= Config.PerfRemoteCooldown then
+        remoteCooldowns[model] = now
+        pcall(function()
+            for _, object in ipairs(model:GetDescendants()) do
+                if object:IsA("RemoteEvent") then
+                    local name = object.Name:lower()
+                    if name:find("damage") or name:find("hit") or name:find("attack") then
+                        object:FireServer(part, 999999999)
+                    end
+                end
+            end
+        end)
+    end
+
+    humanoid = getHumanoid(model)
+    if humanoid and humanoid.Health > 0 then
+        pcall(function()
+            for _, object in ipairs(model:GetDescendants()) do
+                if object:IsA("BasePart") then object:BreakJoints() end
+            end
+        end)
+
+        local tool = lp.Character and lp.Character:FindFirstChildOfClass("Tool")
+        local handle = tool and (tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart"))
+        if handle and fireTouch then
+            pcall(function()
+                for _, object in ipairs(model:GetChildren()) do
+                    if object:IsA("BasePart") then
+                        fireTouch(handle, object, 0)
+                        fireTouch(handle, object, 1)
+                    end
+                end
+            end)
+        end
+    end
+end
+
+local hookedHandles = setmetatable({}, { __mode = "k" })
+
+local function hookTouchPart(part)
+    if not part:IsA("BasePart") or hookedHandles[part] then return end
+    hookedHandles[part] = true
+
+    bind(part.Touched, function(hit)
+        if not (Config.ReachTouchKill and Config.ReachEnabled) then return end
+
+        local model = hit:FindFirstAncestorOfClass("Model")
+        if not model or not npcSet[model] or isPlayerCharacter(model) then return end
+
+        local character = lp.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local npcRoot = getRoot(model)
+        if not (root and npcRoot) then return end
+
+        if (root.Position - npcRoot.Position).Magnitude <= Config.ReachTouchRange + Config.ReachDistance then
+            killNPCTouch(model, hit)
+        end
+    end)
+end
+
+local function hookTouchTool(tool)
+    if not tool:IsA("Tool") then return end
+    local handle = tool:FindFirstChild("Handle")
+    if handle then hookTouchPart(handle) end
+    bind(tool.ChildAdded, function(child)
+        if child.Name == "Handle" then hookTouchPart(child) end
+    end)
+end
+
+task.spawn(function()
+    while running do
+        task.wait(0.1)
+
+        if Config.ReachTouchKill and Config.ReachEnabled and not Shared.parryBusy then
+            local character = lp.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local tool = character and character:FindFirstChildOfClass("Tool")
+            local handle = tool and (tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart"))
+
+            if root and handle then
+                local range = Config.ReachTouchRange + Config.ReachDistance
+                local inRange = {}
+
+                for _, npc in ipairs(getNPCs()) do
+                    local npcRoot = npc.Parent and getRoot(npc)
+                    if npcRoot then
+                        local d = math.min(
+                            (handle.Position - npcRoot.Position).Magnitude,
+                            (root.Position - npcRoot.Position).Magnitude
+                        )
+                        if d <= range then
+                            inRange[#inRange + 1] = { npc = npc, root = npcRoot, dist = d }
+                        end
+                    end
+                end
+
+                if #inRange > 1 then
+                    table.sort(inRange, function(a, b) return a.dist < b.dist end)
+                end
+
+                for i = 1, math.min(#inRange, Config.PerfMaxTargets) do
+                    killNPCTouch(inRange[i].npc, inRange[i].root)
+                end
+            end
+        end
+    end
+end)
+
+-- Tool / swing tracking
+local isSwinging = false
+local originalHandle = setmetatable({}, { __mode = "k" })
+local cooldowns = setmetatable({}, { __mode = "k" })
+
+local function restoreHandle(handle)
+    local saved = originalHandle[handle]
+    if saved and handle.Parent then
+        handle.Size = saved.size
+        handle.Transparency = saved.transparency
+        handle.Massless = saved.massless
+        handle.CanCollide = saved.canCollide
+    end
+    originalHandle[handle] = nil
+end
+
+local function hookReachTool(tool)
+    if not tool:IsA("Tool") then return end
+
+    hookTouchTool(tool)
+
+    bind(tool.Equipped, function() isSwinging = false end)
+    bind(tool.Activated, function()
+        isSwinging = true
+        Shared.lastActivated = os.clock()
+    end)
+    bind(tool.Deactivated, function() isSwinging = false end)
+    bind(tool.Unequipped, function()
+        isSwinging = false
+        local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+        if handle then restoreHandle(handle) end
+    end)
+end
+
+local function hookReachCharacter(character)
+    for _, child in ipairs(character:GetChildren()) do
+        hookReachTool(child)
+    end
+    bind(character.ChildAdded, hookReachTool)
+end
+
+bind(lp.CharacterAdded, hookReachCharacter)
+if lp.Character then hookReachCharacter(lp.Character) end
+
+onCleanup(function()
+    for handle in pairs(originalHandle) do
+        restoreHandle(handle)
+    end
+end)
+
+-- Attack logic
+local COMBAT = {
+    Legit    = { fixedDelay = 0.2, multihit = 1 },
+    Standard = { delayMul = 0.8,   multihit = 2 },
+    Extreme  = { fixedDelay = 0,   multihit = 25 },
+    Deadly   = { fixedDelay = 0,   multihit = 40 },
+}
+
+local function instaKillTarget(model, handle, tool, character)
+    local now = os.clock()
+    if now - (cooldowns[model] or 0) < Config.ReachInstaKillRate then return end
+    cooldowns[model] = now
+
+    local parts, seen = {}, {}
+    local function add(part)
+        if part and part:IsA("BasePart") and not seen[part] then
+            seen[part] = true
+            parts[#parts + 1] = part
+        end
+    end
+
+    add(model:FindFirstChild("HumanoidRootPart"))
+    add(model:FindFirstChild("UpperTorso"))
+    add(model:FindFirstChild("Torso"))
+    add(model:FindFirstChild("Head"))
+    for _, child in ipairs(model:GetChildren()) do
+        if #parts >= Config.ReachInstaKillParts then break end
+        add(child)
+    end
+
+    for i = 1, math.min(#parts, Config.ReachInstaKillParts) do
+        local part = parts[i]
+        pcall(function()
+            fireTouch(handle, part, 0)
+            fireTouch(handle, part, 1)
+        end)
+    end
+
+    pcall(function()
+        if tool.Parent == character then tool:Activate() end
+    end)
+end
+
+local function normalHit(model, targetRoot, handle)
+    local profile = COMBAT[Config.ReachProfile] or COMBAT.Standard
+    local delay = profile.fixedDelay or (Config.ReachHitDelay * (profile.delayMul or 1))
+    local multihit = profile.multihit
+
+    if Config.ReachAggressive then
+        delay = 0
+        multihit = multihit * 2
+    end
+
+    local now = os.clock()
+    if now - (cooldowns[model] or 0) < delay then return end
+    cooldowns[model] = now
+
+    local bodyParts = {}
+    if Config.ReachAggressive then
+        for _, part in ipairs(model:GetChildren()) do
+            if part:IsA("BasePart") then bodyParts[#bodyParts + 1] = part end
+        end
+    else
+        bodyParts[1] = targetRoot
+        local torso = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+        if torso then bodyParts[#bodyParts + 1] = torso end
+        if Config.ReachProfile == "Deadly" then
+            local head = model:FindFirstChild("Head")
+            if head then bodyParts[#bodyParts + 1] = head end
+        end
+    end
+
+    for _ = 1, multihit do
+        for _, part in ipairs(bodyParts) do
+            pcall(function()
+                fireTouch(handle, part, 0)
+                fireTouch(handle, part, 1)
+            end)
+        end
+    end
+end
+
+local function performReach()
+    if not Config.ReachEnabled or not fireTouch or Shared.parryBusy then return end
+
+    local character = lp.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local tool = character and character:FindFirstChildOfClass("Tool")
+    local handle = tool and (tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart"))
+    if not (root and handle) then return end
+
+    if Config.ReachExpandWeapon then
+        if not originalHandle[handle] then
+            originalHandle[handle] = {
+                size = handle.Size,
+                transparency = handle.Transparency,
+                massless = handle.Massless,
+                canCollide = handle.CanCollide,
+            }
+        end
+        local d = math.min(Config.ReachDistance, 2048)
+        handle.Size = Vector3.new(d, d, d)
+        handle.Massless = true
+        handle.CanCollide = false
+        handle.Transparency = 1
+    elseif originalHandle[handle] then
+        restoreHandle(handle)
+    end
+
+    -- "Swinging" = a recent activation, or the button is held (manual play only)
+    local swinging = (os.clock() - Shared.lastActivated < 0.35) or (isSwinging and not Config.AutoClick)
+    if not (swinging or Config.ReachAlwaysActive or Config.ReachInstaKill) then return end
+
+    local ping = getPing()
+    local origin = root.Position
+    local rootCF = root.CFrame
+    local processed = 0
+
+    local candidates = {}
+    local prefilter = Config.ReachDistance * 2 + Config.ReachRandomStrength + 10
+    for _, model in ipairs(getNPCs()) do
+        local targetRoot = model:FindFirstChild("HumanoidRootPart")
+        if targetRoot then
+            local dist = (origin - targetRoot.Position).Magnitude
+            if dist <= prefilter then
+                candidates[#candidates + 1] = { model = model, root = targetRoot, dist = dist }
+            end
+        end
+    end
+
+    if #candidates > 1 then
+        table.sort(candidates, function(a, b) return a.dist < b.dist end)
+    end
+
+    for _, c in ipairs(candidates) do
+        if processed >= Config.PerfMaxTargets then break end
+
+        local model, targetRoot = c.model, c.root
+        local humanoid = getHumanoid(model)
+
+        if humanoid and humanoid.Health > 0 then
+            local targetPos = targetRoot.Position
+            if Config.ReachPredictive and not Config.ReachAggressive then
+                targetPos = targetPos + targetRoot.AssemblyLinearVelocity * (ping / 1000)
+            end
+
+            local hit = inReachHitbox(origin, targetPos, rootCF)
+
+            if not hit and Config.ReachBacktrack then
+                local buffer = backtrackBuffers[model]
+                if buffer then
+                    for i = #buffer, 1, -1 do
+                        if inReachHitbox(origin, buffer[i].pos, rootCF) then
+                            targetPos = buffer[i].pos
+                            hit = true
+                            break
+                        end
+                    end
+                end
+            end
+
+            if hit and Config.ReachWallCheck and not Config.ReachAggressive
+                and isWallBetween(origin, targetPos, model) then
+                hit = false
+            end
+
+            if hit then
+                processed = processed + 1
+                if Config.ReachInstaKill then
+                    instaKillTarget(model, handle, tool, character)
+                else
+                    normalHit(model, targetRoot, handle)
+                end
+            end
+        end
+    end
+end
+
+bind(RunService.Heartbeat, performReach)
+
+----------------------------------------------------------------------
+-- ===================== AUTO CLICKER ================================
+----------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.AutoClick and not Shared.parryBusy then
+            local character = lp.Character
+            local tool = character and character:FindFirstChildOfClass("Tool")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+
+            local allowed = tool ~= nil and tool.Enabled and root ~= nil
+            if allowed and Config.ClickNearOnly then
+                allowed = false
+                local range = Config.ReachDistance + 5
+                for _, npc in ipairs(getNPCs()) do
+                    local npcRoot = npc.Parent and getRoot(npc)
+                    local humanoid = getHumanoid(npc)
+                    if npcRoot and humanoid and humanoid.Health > 0
+                        and (npcRoot.Position - root.Position).Magnitude <= range then
+                        allowed = true
+                        break
+                    end
+                end
+            end
+
+            if allowed then
+                Shared.lastActivated = os.clock()
+                pcall(function() tool:Activate() end)
+            end
+
+            task.wait(1 / math.max(Config.ClickCPS, 1))
+        else
+            task.wait(0.1)
+        end
+    end
+end)
+
+----------------------------------------------------------------------
+-- ===================== NPC ESP =====================================
+----------------------------------------------------------------------
+local espFolder = Instance.new("Folder")
+espFolder.Name = "xTimeESP"
+mountGui(espFolder)
+onCleanup(function() espFolder:Destroy() end)
+
+local espEntries = {}
+
+local function removeESP(model)
+    local entry = espEntries[model]
+    if entry then
+        entry.gui:Destroy()
+        entry.highlight:Destroy()
+        espEntries[model] = nil
+    end
+end
+
+local function clearESP()
+    for model in pairs(espEntries) do
+        removeESP(model)
+    end
+end
+
+local function createESP(model, root)
+    local gui = Instance.new("BillboardGui")
+    gui.Name = "NPCLabel"
+    gui.Adornee = root
+    gui.AlwaysOnTop = true
+    gui.Size = UDim2.fromOffset(180, 48)
+    gui.StudsOffset = Vector3.new(0, 3.6, 0)
+    gui.Parent = espFolder
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 13
+    label.TextStrokeTransparency = 0.4
+    label.TextWrapped = true
+    label.Parent = gui
+
+    local highlight = Instance.new("Highlight")
+    highlight.Adornee = model
+    highlight.FillTransparency = 0.65
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Parent = espFolder
+
+    local entry = { gui = gui, label = label, highlight = highlight }
+    espEntries[model] = entry
+    return entry
+end
+
+task.spawn(function()
+    while running do
+        task.wait(0.1)
+
+        if not Config.ESPEnabled then
+            if next(espEntries) then clearESP() end
+        else
+            local character = lp.Character
+            local myRoot = character and character:FindFirstChild("HumanoidRootPart")
+            local seen = {}
+
+            if myRoot then
+                for _, model in ipairs(getNPCs()) do
+                    local humanoid = getHumanoid(model)
+                    local root = model.Parent and getRoot(model)
+                    if humanoid and humanoid.Health > 0 and root then
+                        local dist = (root.Position - myRoot.Position).Magnitude
+                        if dist <= Config.ESPMaxDistance then
+                            seen[model] = true
+
+                            local entry = espEntries[model] or createESP(model, root)
+                            if entry.gui.Adornee ~= root then entry.gui.Adornee = root end
+
+                            entry.highlight.Enabled = Config.ESPHighlight
+                            entry.highlight.FillColor = Config.ESPColor
+                            entry.highlight.OutlineColor = Config.ESPColor
+
+                            local lines = {}
+                            if Config.ESPNames then
+                                lines[#lines + 1] = model.Name
+                            end
+                            if Config.ESPHealth then
+                                lines[#lines + 1] = string.format("HP %d / %d",
+                                    math.floor(humanoid.Health), math.floor(humanoid.MaxHealth))
+                            end
+                            if Config.ESPDistance then
+                                lines[#lines + 1] = string.format("%d studs", math.floor(dist))
+                            end
+
+                            entry.label.Text = table.concat(lines, "\n")
+                            entry.label.TextColor3 = Config.ESPColor
+                            entry.label.Visible = #lines > 0
+                        end
+                    end
+                end
+            end
+
+            for model in pairs(espEntries) do
+                if not seen[model] then removeESP(model) end
+            end
+        end
+    end
+end)
+
+----------------------------------------------------------------------
+-- ===================== NAME CHANGER ================================
+----------------------------------------------------------------------
+local originalText = setmetatable({}, { __mode = "k" })
+
+local function plainReplace(text, find, replacement)
+    if find == "" then return text end
+    local parts, index = {}, 1
+    while true do
+        local from, to = string.find(text, find, index, true)
+        if not from then
+            parts[#parts + 1] = string.sub(text, index)
+            break
+        end
+        parts[#parts + 1] = string.sub(text, index, from - 1)
+        parts[#parts + 1] = replacement
+        index = to + 1
+    end
+    return table.concat(parts)
+end
+
+local function applyIdentityTo(object)
+    local current = object.Text
+    if current == "" then return end
+
+    local newName = Config.Identity
+    local updated = plainReplace(current, "@" .. lp.Name, "@" .. string.lower(newName))
+    updated = plainReplace(updated, lp.DisplayName, newName)
+    updated = plainReplace(updated, lp.Name, newName)
+
+    if updated ~= current then
+        originalText[object] = originalText[object] or current
+        object.Text = updated
+    end
+end
+
+local function isOwnGui(object)
+    if object:FindFirstAncestor("xTimeESP") or object:FindFirstAncestor("xTimeButtons") then
+        return true
+    end
+    local screenGui = object:FindFirstAncestorWhichIsA("ScreenGui")
+    return screenGui ~= nil and screenGui.Name == "WindUI"
+end
+
+local function forEachTextObject(callback)
+    local function walk(root)
+        for _, object in ipairs(root:GetDescendants()) do
+            if (object:IsA("TextLabel") or object:IsA("TextButton")) and not isOwnGui(object) then
+                callback(object)
+            end
+        end
+    end
+    pcall(walk, CoreGui)
+    pcall(walk, playerGui)
+end
+
+task.spawn(function()
+    while running do
+        if Config.IdentityApplied then
+            forEachTextObject(applyIdentityTo)
+        end
+        task.wait(1)
+    end
+end)
+
+local function restoreIdentity()
+    Config.IdentityApplied = false
+    for object, text in pairs(originalText) do
+        if object.Parent then object.Text = text end
+    end
+    table.clear(originalText)
+end
+
+----------------------------------------------------------------------
+-- ===================== UI HELPERS ==================================
+----------------------------------------------------------------------
+local ACCENT = Color3.fromHex("#38bdf8")
+local ACCENT2 = Color3.fromHex("#818cf8")
+
+local UI = {}                  -- element registry (key -> Wind-UI element)
+local refreshButtons = function() end
+local refreshHome = function() end
+
+-- Features that have a master switch, a hotkey and an on-screen button
+local FEATURES = {
+    { key = "AutoParry",    label = "Auto Parry" },
+    { key = "ReachEnabled", label = "NPC Reach" },
+    { key = "AutoClick",    label = "Auto Clicker" },
+    { key = "TPWalk",       label = "TP Walk" },
+    { key = "FloatEnabled", label = "Floating Ground" },
+    { key = "ESPEnabled",   label = "NPC ESP" },
+}
+
+local FEATURE_LABEL = {}
+for _, feature in ipairs(FEATURES) do
+    FEATURE_LABEL[feature.key] = feature.label
+end
+
+local lastNotified = {}
+local function notifyState(key, state)
+    local label = FEATURE_LABEL[key]
+    if not label then return end
+    if lastNotified[key] == nil then lastNotified[key] = false end
+    if lastNotified[key] == state then return end
+    lastNotified[key] = state
+    notify(label, state and "Turned ON" or "Turned OFF", 2, state and "check" or "x")
+end
+
+local function setUI(key, value)
+    if Config[key] ~= nil then
+        Config[key] = value
+    end
+    local element = UI[key]
+    if element and element.Set then
+        pcall(function() element:Set(value) end)
+    end
+end
+
+local function toggleFeature(key)
+    local newState = not Config[key]
+    Config[key] = newState
+    if key == "FloatEnabled" then
+        setFloatEnabled(newState)
+    end
+    setUI(key, newState)
+    notifyState(key, newState)
+    refreshButtons()
+    refreshHome()
+end
+
+local function group(parent, title, icon, opened)
+    return parent:Section({ Title = title, Icon = icon, Opened = opened ~= false })
+end
+
+local function addToggle(parent, key, title, desc, onChange)
+    local element = parent:Toggle({
+        Title = title,
+        Desc = desc,
+        Flag = key,
+        Value = Config[key],
+        Callback = function(state)
+            Config[key] = state
+            if onChange then onChange(state) end
+            notifyState(key, state)
+            refreshButtons()
+            refreshHome()
+        end,
+    })
+    UI[key] = element
+    return element
+end
+
+local function addSlider(parent, key, title, desc, min, max, step, onChange)
+    local element = parent:Slider({
+        Title = title,
+        Desc = desc,
+        Flag = key,
+        Step = step,
+        Value = { Min = min, Max = max, Default = Config[key] },
+        Callback = function(value)
+            Config[key] = value
+            if onChange then onChange(value) end
+        end,
+    })
+    UI[key] = element
+    return element
+end
+
+local function addDropdown(parent, key, title, desc, values, onChange)
+    local element = parent:Dropdown({
+        Title = title,
+        Desc = desc,
+        Flag = key,
+        Values = values,
+        Value = Config[key],
+        Callback = function(selected)
+            Config[key] = selected
+            if onChange then onChange(selected) end
+        end,
+    })
+    UI[key] = element
+    return element
+end
+
+local function addHotkey(parent, flag, title, defaultKey, key)
+    parent:Keybind({
+        Title = title,
+        Desc = "Click, then press a key. Works on PC. On mobile use the on-screen buttons.",
+        Flag = flag,
+        Value = defaultKey,
+        Callback = function()
+            toggleFeature(key)
+        end,
+    })
+end
+
+----------------------------------------------------------------------
+-- ===================== WINDOW ======================================
+----------------------------------------------------------------------
+local viewport = (Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize) or Vector2.new(1280, 720)
+local winWidth = math.clamp(viewport.X - 40, 360, 640)
+local winHeight = math.clamp(viewport.Y - 40, 300, 480)
+
+Window = WindUI:CreateWindow({
+    Title = APP_NAME,
+    Icon = LOGO,
+    Author = "NPC toolkit  |  PC + Mobile",
+    Folder = "xTimeSDBF",
+    Size = UDim2.fromOffset(winWidth, winHeight),
+    MinSize = Vector2.new(340, 280),
+    Theme = "xTime Midnight",
+    Transparent = true,
+    Resizable = true,
+    SideBarWidth = 180,
+    ScrollBarEnabled = true,
+    ToggleKey = Enum.KeyCode.L,
+})
+
+if not Window then
+    error("[xTime] Could not create the Wind-UI window.")
+end
+
+pcall(function()
+    Window:EditOpenButton({
+        Title = "xTime",
+        Icon = LOGO,
+        CornerRadius = UDim.new(0, 16),
+        StrokeThickness = 2,
+        Color = ColorSequence.new(ACCENT, ACCENT2),
+        Draggable = true,
+        OnlyMobile = false,
+        Enabled = true,
+    })
+end)
+
+pcall(function()
+    Window:Tag({ Title = "v4.0", Color = Color3.fromHex("#0ea5e9") })
+end)
+
+pcall(function()
+    Window:OnDestroy(function()
+        if running then
+            Window = nil
+            cleanup()
+        end
+    end)
+end)
+
+local MainGroup     = Window:Section({ Title = "Main", Opened = true })
+local CombatGroup   = Window:Section({ Title = "Combat", Opened = true })
+local MovementGroup = Window:Section({ Title = "Movement", Opened = true })
+local VisualGroup   = Window:Section({ Title = "Visuals", Opened = true })
+local SystemGroup   = Window:Section({ Title = "System", Opened = true })
+
+----------------------------------------------------------------------
+-- TAB: Home
+----------------------------------------------------------------------
+local HomeTab = MainGroup:Tab({ Title = "Home", Icon = "home" })
+
+local HomeStatusSection = group(HomeTab, "Status", "activity")
+local HomeStatus = HomeStatusSection:Paragraph({ Title = "Features", Desc = "-" })
+
+refreshHome = function()
+    local lines = {}
+    for _, feature in ipairs(FEATURES) do
+        lines[#lines + 1] = string.format("%s: %s", feature.label, Config[feature.key] and "ON" or "off")
+    end
+    pcall(function() HomeStatus:SetDesc(table.concat(lines, "\n")) end)
+end
+
+local HomeHelp = group(HomeTab, "How to use", "info")
+HomeHelp:Paragraph({
+    Title = "1. Pick a tab on the left",
+    Desc = "Each feature has its own tab. Turn the feature ON at the top of its tab, then adjust the settings below it.",
+})
+HomeHelp:Paragraph({
+    Title = "2. Hotkeys (PC)",
+    Desc = "L = show/hide this menu\nF = Auto Parry\nJ = NPC Reach\nB = Auto Clicker\nV = TP Walk\nN = Floating Ground\nH = NPC ESP\nEvery hotkey can be changed inside its tab.",
+})
+HomeHelp:Paragraph({
+    Title = "3. Mobile",
+    Desc = "Tap the floating \"xTime\" button to open or close the menu. Turn on On-Screen Buttons in System > Settings to get quick ON/OFF buttons you can drag anywhere.",
+})
+
+local HomeAbout = group(HomeTab, "About this script", "layers")
+HomeAbout:Paragraph({
+    Title = "A combined and slightly improved script",
+    Desc = "xTime sdbf puts several separate scripts together in one menu: Auto Parry, NPC Reach, Boss Lock/Orbit and Floating Ground. It adds an Auto Clicker, TP Walk, NPC ESP and on-screen buttons for mobile. The original code was also tidied up a little: faster NPC detection, fewer bugs, and every feature shares one settings system and one Unload button.",
+})
+
+----------------------------------------------------------------------
+-- TAB: Auto Parry
+----------------------------------------------------------------------
+local ParryTab = CombatGroup:Tab({ Title = "Auto Parry", Icon = "shield-check" })
+
+local ParryMain = group(ParryTab, "Auto Parry", "shield")
+addToggle(ParryMain, "AutoParry", "Enable Auto Parry",
+    "Detects the incoming-attack warning on your character and presses E for you.")
+addHotkey(ParryMain, "ParryKey", "Hotkey: Auto Parry", "F", "AutoParry")
+addDropdown(ParryMain, "ParryMode", "Parry mode",
+    "\"Ivory > Azure\" fires Ivory twice, then swaps to Azure. \"Azure only\" just uses Azure.",
+    { "Ivory > Azure", "Azure only" })
+addToggle(ParryMain, "AzureAutoE", "Auto-press E when I equip Azure",
+    "If you pick up Azure by hand while Auto Parry is ON, E is pressed for you.")
+
+local ParryPresets = group(ParryTab, "Quick presets", "sliders-horizontal")
+ParryPresets:Button({
+    Title = "Perfect",
+    Desc = "Instant reaction, ping compensated.",
+    Callback = function()
+        setUI("Delay", 0)
+        setUI("Humanize", false)
+        setUI("PingComp", true)
+        setUI("Cooldown", 200)
+        setUI("Settle", 25)
+        notify("Preset", "Perfect applied", 2, "zap")
+    end,
+})
+ParryPresets:Button({
+    Title = "Legit",
+    Desc = "Random 90-180 ms delay so it looks more human.",
+    Callback = function()
+        setUI("Humanize", true)
+        setUI("HumanizeMin", 90)
+        setUI("HumanizeMax", 180)
+        setUI("PingComp", false)
+        setUI("Cooldown", 400)
+        notify("Preset", "Legit applied", 2, "user")
+    end,
+})
+
+local ParryTiming = group(ParryTab, "Timing (advanced)", "timer", false)
+addSlider(ParryTiming, "Delay", "Reaction delay (ms)", "Wait this long after the warning appears.", 0, 300, 5)
+addToggle(ParryTiming, "PingComp", "Ping compensation", "Subtracts your ping from the delay.")
+addToggle(ParryTiming, "Humanize", "Random delay", "Uses a random delay between Min and Max below.")
+addSlider(ParryTiming, "HumanizeMin", "Random delay: min (ms)", nil, 0, 400, 5)
+addSlider(ParryTiming, "HumanizeMax", "Random delay: max (ms)", nil, 0, 400, 5)
+addSlider(ParryTiming, "Settle", "Equip wait (ms)", "Short wait after equipping a tool before pressing E.", 0, 100, 5)
+addSlider(ParryTiming, "Cooldown", "Cooldown (ms)", "Blocks duplicate triggers.", 50, 1000, 10)
+
+local ParryStats = group(ParryTab, "Stats", "activity")
+local ParryStatus = ParryStats:Paragraph({ Title = "Live stats", Desc = "-" })
+
+refreshStatus = function()
+    pcall(function()
+        ParryStatus:SetDesc(string.format(
+            "Parries: %d\nReaction time: %s\nPing: %d ms",
+            telemetry.parries,
+            telemetry.latency and string.format("%.0f ms", telemetry.latency) or "-",
+            telemetry.ping
+        ))
+    end)
+end
+
+task.spawn(function()
+    while running do
+        telemetry.ping = getPing()
+        refreshStatus()
+        task.wait(1)
+    end
+end)
+
+----------------------------------------------------------------------
+-- TAB: NPC Reach
+----------------------------------------------------------------------
+local ReachTab = CombatGroup:Tab({ Title = "NPC Reach", Icon = "crosshair" })
+
+if not fireTouch then
+    ReachTab:Paragraph({
+        Title = "Your executor does not support firetouchinterest",
+        Desc = "NPC Reach needs firetouchinterest to work.",
+    })
+end
+
+local ReachMain = group(ReachTab, "NPC Reach", "crosshair")
+addToggle(ReachMain, "ReachEnabled", "Enable NPC Reach",
+    "Lets your held weapon hit NPCs from farther away. Players are never targeted.")
+addHotkey(ReachMain, "ReachKey", "Hotkey: NPC Reach", "J", "ReachEnabled")
+addSlider(ReachMain, "ReachDistance", "Reach distance (studs)", "How far you can hit (up to 5000).", 5, 5000, 1)
+addDropdown(ReachMain, "ReachProfile", "Attack style",
+    "Legit = must face the NPC. Standard = balanced. Extreme / Deadly = many hits per swing.",
+    { "Legit", "Standard", "Extreme", "Deadly" })
+addDropdown(ReachMain, "ReachShape", "Hit area shape",
+    "Sphere = all around you. Square = box. Line = straight ahead. Sector = fan in front.",
+    { "Sphere", "Square", "Line", "Sector" })
+addToggle(ReachMain, "ReachAlwaysActive", "Hit without swinging",
+    "Attacks NPCs in range automatically, no click needed.")
+addSlider(ReachMain, "ReachHitDelay", "Time between hits (s)", nil, 0, 0.5, 0.01)
+ReachMain:Button({
+    Title = "Rescan NPCs",
+    Desc = "Use this if an NPC is not being detected.",
+    Callback = function()
+        table.clear(npcSet)
+        npcListDirty = true
+        task.spawn(scanNPCs)
+        notify("NPC Reach", "Rescanning NPCs...", 2, "refresh-cw")
+    end,
+})
+
+local ReachClicker = group(ReachTab, "Auto Clicker", "mouse-pointer-click")
+addToggle(ReachClicker, "AutoClick", "Enable Auto Clicker",
+    "Uses the tool you are holding again and again. It pauses while Auto Parry is swapping tools.")
+addHotkey(ReachClicker, "ClickKey", "Hotkey: Auto Clicker", "B", "AutoClick")
+addSlider(ReachClicker, "ClickCPS", "Clicks per second", nil, 1, 50, 1)
+addToggle(ReachClicker, "ClickNearOnly", "Only click when an NPC is nearby",
+    "Saves your weapon swings. Uses your Reach distance + 5 studs.")
+
+local ReachAdv = group(ReachTab, "Advanced", "settings-2", false)
+addToggle(ReachAdv, "ReachExpandWeapon", "Enlarge weapon hitbox", "Makes your weapon handle as big as the reach distance.")
+addToggle(ReachAdv, "ReachAggressive", "Aggressive mode", "Ignores facing direction and hits every body part.")
+addToggle(ReachAdv, "ReachPredictive", "Predict NPC movement", "Aims where the NPC will be, based on your ping.")
+addToggle(ReachAdv, "ReachBacktrack", "Backtrack", "Can also hit where the NPC was a moment ago.")
+addSlider(ReachAdv, "ReachBacktrackWindow", "Backtrack time (s)", nil, 0.1, 1, 0.1)
+addToggle(ReachAdv, "ReachWallCheck", "Wall check", "Does not hit through walls.")
+addToggle(ReachAdv, "ReachRandom", "Randomize distance", "Adds a small random change to the reach distance.")
+addSlider(ReachAdv, "ReachRandomStrength", "Randomize amount", nil, 0.1, 10, 0.1)
+
+local ReachKill = group(ReachTab, "Kill modes (risky)", "skull", false)
+addToggle(ReachKill, "ReachInstaKill", "Instakill",
+    "Touches many NPC body parts at once with your weapon.", function(state)
+        if state then notify("NPC Reach", "Instakill is ON. This is easier for games to detect.", 3, "alert-triangle") end
+    end)
+addSlider(ReachKill, "ReachInstaKillParts", "Body parts touched", nil, 1, 50, 1)
+addSlider(ReachKill, "ReachInstaKillRate", "Time between attempts (s)", nil, 0, 0.5, 0.01)
+addToggle(ReachKill, "ReachTouchKill", "Touch Kill",
+    "Touching an NPC with your weapon tries to kill it instantly.", function(state)
+        if state then notify("NPC Reach", "Touch Kill is ON. This is easier for games to detect.", 3, "alert-triangle") end
+    end)
+addSlider(ReachKill, "ReachTouchRange", "Touch Kill extra range (studs)", nil, 1, 50, 1)
+
+local ReachVisual = group(ReachTab, "Reach display", "eye", false)
+addToggle(ReachVisual, "ReachShowVisualizer", "Show reach area", "Draws the hit area around you. Turns red in risky modes.")
+addSlider(ReachVisual, "ReachVisualizerTransparency", "Area transparency", nil, 0, 1, 0.05)
+
+local PERF_PRESETS = {
+    Quality     = { PerfMaxTargets = 30, PerfKillThrottle = 0.05, PerfRemoteCooldown = 0.1 },
+    Balanced    = { PerfMaxTargets = 6,  PerfKillThrottle = 0.15, PerfRemoteCooldown = 0.5 },
+    Performance = { PerfMaxTargets = 3,  PerfKillThrottle = 0.25, PerfRemoteCooldown = 1.0 },
+    Extreme     = { PerfMaxTargets = 1,  PerfKillThrottle = 0.4,  PerfRemoteCooldown = 2.0 },
+}
+
+local ReachPerf = group(ReachTab, "Performance (anti-lag)", "gauge", false)
+addDropdown(ReachPerf, "PerfMode", "Performance mode",
+    "Quality = most accurate. Extreme = highest FPS. Try Performance if you fight 3+ NPCs.",
+    { "Quality", "Balanced", "Performance", "Extreme" }, function(mode)
+        local preset = PERF_PRESETS[mode]
+        if preset then
+            for key, value in pairs(preset) do
+                setUI(key, value)
+            end
+        end
+    end)
+addSlider(ReachPerf, "PerfMaxTargets", "NPCs handled per frame", nil, 1, 30, 1)
+addSlider(ReachPerf, "PerfKillThrottle", "Kill cooldown (s)", nil, 0, 1, 0.01)
+addSlider(ReachPerf, "PerfRemoteCooldown", "Remote cooldown (s)", nil, 0, 3, 0.1)
+
+----------------------------------------------------------------------
+-- TAB: Boss
+----------------------------------------------------------------------
+local BossTab = CombatGroup:Tab({ Title = "Boss", Icon = "skull" })
+
+local BossMain = group(BossTab, "Boss helpers", "target")
+addToggle(BossMain, "BossLock", "Boss Lock", "Turns your character to face the closest NPC / boss.")
+addToggle(BossMain, "BossOrbit", "Boss Orbit",
+    "Circles around the closest NPC. With Floating Ground ON, you keep the platform height.")
+addSlider(BossMain, "OrbitDistance", "Orbit distance (studs)", nil, 1, 20, 1)
+addSlider(BossMain, "OrbitSpeed", "Orbit speed", nil, 1, 200, 1)
+
+local BossTargetSection = group(BossTab, "Current target", "crosshair")
+local BossTargetLabel = BossTargetSection:Paragraph({
+    Title = "Target: idle (Boss Lock and Orbit are off)",
+    Desc = "Searches within 500 studs.",
+})
+setTargetLabel = function(text)
+    pcall(function() BossTargetLabel:SetTitle(text) end)
+end
+
+----------------------------------------------------------------------
+-- TAB: TP Walk
+----------------------------------------------------------------------
+local TPTab = MovementGroup:Tab({ Title = "TP Walk", Icon = "footprints" })
+
+local TPMain = group(TPTab, "TP Walk", "footprints")
+addToggle(TPMain, "TPWalk", "Enable TP Walk",
+    "Moves you forward in small steps while you walk. Works with keyboard and the mobile thumbstick.")
+addHotkey(TPMain, "TPKey", "Hotkey: TP Walk", "V", "TPWalk")
+addSlider(TPMain, "TPWalkSpeed", "Extra speed (studs per second)",
+    "Added on top of your normal walk speed. Start low (20-40) if the game is strict.", 1, 300, 1)
+
+----------------------------------------------------------------------
+-- TAB: Floating Ground
+----------------------------------------------------------------------
+local FloatTab = MovementGroup:Tab({ Title = "Floating Ground", Icon = "arrow-up-from-line" })
+
+local FloatMain = group(FloatTab, "Floating Ground", "layers")
+addToggle(FloatMain, "FloatEnabled", "Enable Floating Ground",
+    "Creates a platform under your feet that follows you, with a pole down to the ground.", setFloatEnabled)
+addHotkey(FloatMain, "FloatKey", "Hotkey: Floating Ground", "N", "FloatEnabled")
+addSlider(FloatMain, "FloatHeight", "Height (studs)",
+    "You are moved onto the new platform right away when you change this.", 0, 500, 1, setFloatHeight)
+
+FloatMain:Button({
+    Title = "Height +1",
+    Callback = function()
+        local value = math.clamp(Config.FloatHeight + 1, 0, 500)
+        setUI("FloatHeight", value)
+        setFloatHeight(value)
+    end,
+})
+FloatMain:Button({
+    Title = "Height -1",
+    Callback = function()
+        local value = math.clamp(Config.FloatHeight - 1, 0, 500)
+        setUI("FloatHeight", value)
+        setFloatHeight(value)
+    end,
+})
+
+----------------------------------------------------------------------
+-- TAB: NPC ESP
+----------------------------------------------------------------------
+local ESPTab = VisualGroup:Tab({ Title = "NPC ESP", Icon = "eye" })
+
+local ESPMain = group(ESPTab, "NPC ESP", "eye")
+addToggle(ESPMain, "ESPEnabled", "Enable NPC ESP",
+    "Shows NPCs through walls. Other players are never shown.")
+addHotkey(ESPMain, "ESPKey", "Hotkey: NPC ESP", "H", "ESPEnabled")
+addSlider(ESPMain, "ESPMaxDistance", "Max distance (studs)", nil, 50, 2000, 10)
+
+local ESPLook = group(ESPTab, "What to show", "palette")
+addToggle(ESPLook, "ESPHighlight", "Glow outline", "Colors the NPC's body so it is easy to see.")
+addToggle(ESPLook, "ESPNames", "Name", nil)
+addToggle(ESPLook, "ESPHealth", "Health", nil)
+addToggle(ESPLook, "ESPDistance", "Distance", nil)
+
+pcall(function()
+    UI.ESPColor = ESPLook:Colorpicker({
+        Title = "ESP color",
+        Default = Config.ESPColor,
+        Callback = function(color)
+            Config.ESPColor = color
+        end,
+    })
+end)
+
+----------------------------------------------------------------------
+-- On-screen quick buttons (mobile friendly)
+----------------------------------------------------------------------
+local buttonGui = Instance.new("ScreenGui")
+buttonGui.Name = "xTimeButtons"
+buttonGui.ResetOnSpawn = false
+buttonGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+buttonGui.DisplayOrder = 50
+mountGui(buttonGui)
+onCleanup(function() buttonGui:Destroy() end)
+
+local PANEL_DEFAULT_POS = UDim2.new(1, -124, 0.5, -120)
+
+local panel = Instance.new("Frame")
+panel.Name = "Panel"
+panel.Size = UDim2.fromOffset(112, 0)
+panel.AutomaticSize = Enum.AutomaticSize.Y
+panel.Position = PANEL_DEFAULT_POS
+panel.BackgroundColor3 = Color3.fromHex("#070b14")
+panel.BackgroundTransparency = 0.12
+panel.BorderSizePixel = 0
+panel.Active = true
+panel.Visible = Config.ShowButtons
+panel.Parent = buttonGui
+
+do
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 12)
+    corner.Parent = panel
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = ACCENT
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.3
+    stroke.Parent = panel
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 6)
+    padding.PaddingBottom = UDim.new(0, 6)
+    padding.PaddingLeft = UDim.new(0, 6)
+    padding.PaddingRight = UDim.new(0, 6)
+    padding.Parent = panel
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 5)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = panel
+end
+
+local dragHandle = Instance.new("TextButton")
+dragHandle.Size = UDim2.new(1, 0, 0, 22)
+dragHandle.BackgroundTransparency = 1
+dragHandle.Text = "xTime  (drag)"
+dragHandle.TextColor3 = ACCENT
+dragHandle.Font = Enum.Font.GothamBold
+dragHandle.TextSize = 12
+dragHandle.AutoButtonColor = false
+dragHandle.LayoutOrder = 0
+dragHandle.Parent = panel
+
+do
+    local dragging, dragStart, startPos = false, nil, nil
+
+    bind(dragHandle.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = panel.Position
+        end
+    end)
+
+    bind(UserInputService.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    bind(UserInputService.InputChanged, function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+local quickButtons = {}
+
+local SHORT_LABEL = {
+    AutoParry = "Parry",
+    ReachEnabled = "Reach",
+    AutoClick = "Clicker",
+    TPWalk = "TP Walk",
+    FloatEnabled = "Float",
+    ESPEnabled = "ESP",
+}
+
+for index, feature in ipairs(FEATURES) do
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.new(1, 0, 0, 34)
+    button.BackgroundColor3 = Color3.fromHex("#1e293b")
+    button.TextColor3 = Color3.fromHex("#e2e8f0")
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 13
+    button.AutoButtonColor = true
+    button.LayoutOrder = index
+    button.Parent = panel
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = button
+
+    bind(button.MouseButton1Click, function()
+        toggleFeature(feature.key)
+    end)
+
+    quickButtons[feature.key] = button
+end
+
+do
+    local menuButton = Instance.new("TextButton")
+    menuButton.Size = UDim2.new(1, 0, 0, 34)
+    menuButton.BackgroundColor3 = ACCENT
+    menuButton.TextColor3 = Color3.fromHex("#06101c")
+    menuButton.Font = Enum.Font.GothamBold
+    menuButton.TextSize = 13
+    menuButton.Text = "Menu"
+    menuButton.LayoutOrder = #FEATURES + 1
+    menuButton.Parent = panel
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = menuButton
+
+    bind(menuButton.MouseButton1Click, function()
+        pcall(function() Window:Toggle() end)
+    end)
+end
+
+refreshButtons = function()
+    for _, feature in ipairs(FEATURES) do
+        local button = quickButtons[feature.key]
+        if button then
+            local on = Config[feature.key] and true or false
+            button.Text = SHORT_LABEL[feature.key] .. (on and ": ON" or ": off")
+            button.BackgroundColor3 = on and ACCENT or Color3.fromHex("#1e293b")
+            button.TextColor3 = on and Color3.fromHex("#06101c") or Color3.fromHex("#e2e8f0")
+        end
+    end
+end
+
+refreshButtons()
+refreshHome()
+
+----------------------------------------------------------------------
+-- TAB: Settings
+----------------------------------------------------------------------
+local SettingsTab = SystemGroup:Tab({ Title = "Settings", Icon = "settings" })
+
+local ButtonSection = group(SettingsTab, "On-Screen Buttons", "smartphone")
+ButtonSection:Toggle({
+    Title = "Show quick buttons",
+    Desc = "Small ON/OFF buttons for every feature. Great for mobile. Drag the top bar to move them.",
+    Flag = "ShowButtons",
+    Value = Config.ShowButtons,
+    Callback = function(state)
+        Config.ShowButtons = state
+        panel.Visible = state
+    end,
+})
+ButtonSection:Button({
+    Title = "Reset button position",
+    Callback = function()
+        panel.Position = PANEL_DEFAULT_POS
+    end,
+})
+
+local ThemeSection = group(SettingsTab, "Appearance", "palette")
+
+local themeNames = { "xTime Midnight" }
+pcall(function()
+    for name in pairs(WindUI:GetThemes()) do
+        if name ~= "xTime Midnight" then
+            themeNames[#themeNames + 1] = name
+        end
+    end
+    table.sort(themeNames, function(a, b)
+        if a == "xTime Midnight" then return true end
+        if b == "xTime Midnight" then return false end
+        return a < b
+    end)
+end)
+
+ThemeSection:Dropdown({
+    Title = "Theme",
+    Values = themeNames,
+    Value = "xTime Midnight",
+    SearchBarEnabled = true,
+    Callback = function(name)
+        pcall(function() WindUI:SetTheme(name) end)
+    end,
+})
+ThemeSection:Toggle({
+    Title = "Transparent window",
+    Value = true,
+    Callback = function(state)
+        pcall(function() Window:ToggleTransparency(state) end)
+    end,
+})
+
+local NameSection = group(SettingsTab, "Name changer (only you see it)", "user-pen", false)
+local pendingName = Config.Identity
+
+NameSection:Input({
+    Title = "New name",
+    Placeholder = "Type a name...",
+    Value = Config.Identity,
+    Flag = "IdentityName",
+    Callback = function(text)
+        pendingName = text
+    end,
+})
+NameSection:Button({
+    Title = "Apply name",
+    Callback = function()
+        if pendingName and pendingName ~= "" then
+            Config.Identity = pendingName
+            Config.IdentityApplied = true
+            notify("Name changer", "Name changed (only on your screen)", 3, "check")
+        end
+    end,
+})
+NameSection:Button({
+    Title = "Restore original name",
+    Callback = function()
+        restoreIdentity()
+        notify("Name changer", "Original name restored", 2, "undo-2")
+    end,
+})
+
+local ConfigSection = group(SettingsTab, "Save / Load settings", "save", false)
+local configName = "default"
+
+ConfigSection:Input({
+    Title = "Config name",
+    Value = configName,
+    Callback = function(text)
+        if text and text ~= "" then configName = text end
+    end,
+})
+
+local function withConfig(action)
+    local ok, err = pcall(function()
+        local cfg = Window.ConfigManager:Config(configName)
+        action(cfg)
+    end)
+    if not ok then
+        notify("Config", "Failed (your executor may not support files): " .. tostring(err), 4, "alert-triangle")
+    end
+end
+
+ConfigSection:Button({
+    Title = "Save",
+    Callback = function()
+        withConfig(function(cfg)
+            cfg:Save()
+            notify("Config", "Saved '" .. configName .. "'", 2, "save")
+        end)
+    end,
+})
+ConfigSection:Button({
+    Title = "Load",
+    Callback = function()
+        withConfig(function(cfg)
+            cfg:Load()
+            notify("Config", "Loaded '" .. configName .. "'", 2, "folder-open")
+        end)
+    end,
+})
+
+local UnloadSection = group(SettingsTab, "Unload", "power")
+UnloadSection:Button({
+    Title = "Unload xTime sdbf",
+    Desc = "Turns everything off and removes the menu, platform, ESP and buttons.",
+    Callback = function()
+        cleanup()
+    end,
+})
+
+----------------------------------------------------------------------
+-- Finish
+----------------------------------------------------------------------
+pcall(function() HomeTab:Select() end)
+notify("xTime sdbf", "Loaded! Press L or tap the xTime button to open the menu.", 5, "check")
